@@ -253,6 +253,7 @@ if __name__ == "__main__":
         middleware=[
             (
                 CORSMiddleware,
+                [],
                 {
                     "allow_origins": settings.cors_origins,
                     "allow_methods": ["*"],
