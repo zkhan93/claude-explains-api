@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from fastmcp import FastMCP
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     max_budget_usd: float = 5.00
     host: str = "0.0.0.0"
     port: int = 8000
+    cors_origins: list[str] = ["*"]
 
 
 settings = Settings(_env_file=".env")
@@ -244,4 +246,18 @@ async def query(session_id: str, question: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host=settings.host, port=settings.port)
+    mcp.run(
+        transport="streamable-http",
+        host=settings.host,
+        port=settings.port,
+        middleware=[
+            (
+                CORSMiddleware,
+                {
+                    "allow_origins": settings.cors_origins,
+                    "allow_methods": ["*"],
+                    "allow_headers": ["*"],
+                },
+            ),
+        ],
+    )
