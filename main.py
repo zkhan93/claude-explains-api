@@ -217,7 +217,7 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-
+    print(settings)
     uvicorn.run(
         app,
         host=settings.host,
