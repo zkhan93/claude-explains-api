@@ -250,6 +250,7 @@ if __name__ == "__main__":
         transport="streamable-http",
         host=settings.host,
         port=settings.port,
+        stateless_http=True,
         middleware=[
             (
                 CORSMiddleware,
