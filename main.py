@@ -1,16 +1,11 @@
 import asyncio
-import hashlib
-import io
 import json
 import os
-import shutil
-import tempfile
-import zipfile
+import uuid
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastmcp import FastMCP
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---------------------------------------------------------------------------
@@ -21,81 +16,37 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ANALYZER_")
 
-    cache_dir: Path = Path("cache")
-    claude_timeout_seconds: int = 300
-    max_budget_usd: float = 1.00
+    repos_file: Path = Path("repos.yaml")
     prompts_file: Path = Path("prompts.yaml")
+    claude_timeout_seconds: int = 600
+    max_budget_usd: float = 5.00
     host: str = "0.0.0.0"
     port: int = 8000
 
 
 settings = Settings(_env_file=".env")
-settings.cache_dir.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Prompts
+# Repos & Prompts
 # ---------------------------------------------------------------------------
 
 
-def load_prompts(path: Path) -> dict[str, str]:
+def load_yaml(path: Path) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-PROMPTS = load_prompts(settings.prompts_file)
+REPOS: dict[str, str] = load_yaml(settings.repos_file)
+PROMPTS: dict[str, str] = load_yaml(settings.prompts_file)
 
 # ---------------------------------------------------------------------------
-# App
+# FastMCP server
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="Codebase Analyzer",
-    description="Upload a zipped codebase and get AI-powered architectural analysis",
-)
+mcp = FastMCP("codebase-analyzer")
 
 # ---------------------------------------------------------------------------
-# Cache helpers
-# ---------------------------------------------------------------------------
-
-
-def compute_cache_key(zip_content: bytes, analysis_text: str) -> str:
-    h = hashlib.sha256()
-    h.update(zip_content)
-    h.update(analysis_text.encode("utf-8"))
-    return h.hexdigest()
-
-
-def get_cached_result(cache_key: str) -> dict | None:
-    cache_file = settings.cache_dir / f"{cache_key}.json"
-    if cache_file.exists():
-        return json.loads(cache_file.read_text(encoding="utf-8"))
-    return None
-
-
-def store_cached_result(cache_key: str, result: dict) -> None:
-    cache_file = settings.cache_dir / f"{cache_key}.json"
-    cache_file.write_text(json.dumps(result), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Zip extraction with path-traversal protection
-# ---------------------------------------------------------------------------
-
-
-def safe_extract(zf: zipfile.ZipFile, target_dir: str) -> None:
-    target = Path(target_dir).resolve()
-    for member in zf.infolist():
-        member_path = (target / member.filename).resolve()
-        if not str(member_path).startswith(str(target)):
-            raise HTTPException(
-                status_code=400,
-                detail="Zip contains unsafe path traversal",
-            )
-    zf.extractall(target_dir)
-
-
-# ---------------------------------------------------------------------------
-# Claude CLI runner
+# Claude subprocess runner
 # ---------------------------------------------------------------------------
 
 
@@ -106,25 +57,44 @@ def _claude_env() -> dict[str, str]:
     return env
 
 
-async def run_claude_analysis(codebase_dir: Path, analysis_angle: str) -> str:
-    prompt = PROMPTS["analysis"].format(analysis_angle=analysis_angle)
+async def run_claude(
+    cwd: Path,
+    prompt: str,
+    session_id: str | None = None,
+    resume_id: str | None = None,
+) -> dict:
+    """Run claude CLI and return parsed JSON response.
 
+    Args:
+        cwd: Working directory for claude.
+        prompt: The prompt text.
+        session_id: Create/continue a named session.
+        resume_id: Resume an existing session (mutually exclusive with session_id).
+
+    Returns:
+        dict with keys: result (str), session_id (str), is_error (bool)
+    """
     cmd = [
         "claude",
         "-p",
-        
         "--output-format",
-        "text",
+        "json",
         "--max-budget-usd",
         str(settings.max_budget_usd),
         "--permission-mode",
         "dontAsk",
-        prompt,
     ]
+
+    if resume_id:
+        cmd.extend(["--resume", resume_id])
+    elif session_id:
+        cmd.extend(["--session-id", session_id])
+
+    cmd.append(prompt)
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=str(codebase_dir),
+        cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=_claude_env(),
@@ -138,77 +108,135 @@ async def run_claude_analysis(codebase_dir: Path, analysis_angle: str) -> str:
     except asyncio.TimeoutError:
         process.kill()
         await process.communicate()
-        raise HTTPException(status_code=504, detail="Claude analysis timed out")
+        return {"result": "Claude timed out", "session_id": "", "is_error": True}
 
     if process.returncode != 0:
         error_msg = stderr.decode("utf-8", errors="replace").strip()
-        raise HTTPException(
-            status_code=502,
-            detail=f"Claude CLI failed (exit {process.returncode}): {error_msg}",
-        )
-
-    return stdout.decode("utf-8", errors="replace")
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-
-@app.post("/analyze")
-async def analyze_codebase(
-    file: UploadFile = File(..., description="Zip file of the codebase"),
-    analysis: str = Form(
-        ..., description="Analysis angle/focus, e.g. 'architecture patterns'"
-    ),
-):
-    # 1. Read zip bytes
-    zip_content = await file.read()
-
-    # 2. Validate zip
-    if not zipfile.is_zipfile(io.BytesIO(zip_content)):
-        raise HTTPException(
-            status_code=400, detail="Uploaded file is not a valid zip archive"
-        )
-
-    # 3. Check cache
-    cache_key = compute_cache_key(zip_content, analysis)
-    cached = get_cached_result(cache_key)
-    if cached is not None:
-        cached["cached"] = True
-        return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
-
-    # 4. Extract to temp dir
-    tmp_dir = tempfile.mkdtemp(prefix="codebase_")
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
-            safe_extract(zf, tmp_dir)
-
-        # 5. Run claude analysis
-        analysis_result = await run_claude_analysis(Path(tmp_dir), analysis)
-
-        # 6. Build and cache response
-        result = {
-            "analysis": analysis_result,
-            "cache_key": cache_key,
-            "analysis_angle": analysis,
-            "cached": False,
+        return {
+            "result": f"Claude CLI failed (exit {process.returncode}): {error_msg}",
+            "session_id": "",
+            "is_error": True,
         }
-        store_cached_result(cache_key, result)
 
-        return JSONResponse(content=result, headers={"X-Cache": "MISS"})
+    raw = stdout.decode("utf-8", errors="replace")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"result": raw, "session_id": "", "is_error": False}
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return {
+        "result": data.get("result", raw),
+        "session_id": data.get("session_id", ""),
+        "is_error": data.get("is_error", False),
+    }
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+# ---------------------------------------------------------------------------
+# MCP Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def list_repos() -> str:
+    """List all repositories available for analysis.
+    Call this first to see which repositories are configured."""
+    lines = [f"- {name}: {path}" for name, path in REPOS.items()]
+    return "Available repositories:\n" + "\n".join(lines)
+
+
+@mcp.tool
+async def analyze_repo(repo: str) -> str:
+    """Get a comprehensive analysis of a repository's architecture and design.
+    Call this at the START of any task involving a repository.
+    Returns the project's CLAUDE.md context file and a session_id for follow-up questions.
+
+    If the repo has been analyzed before, returns the cached analysis instantly.
+    If not, runs a full analysis (may take a few minutes).
+
+    Args:
+        repo: Repository name (use list_repos to see available names)
+    """
+    if repo not in REPOS:
+        available = ", ".join(REPOS.keys())
+        return f"Unknown repo '{repo}'. Available: {available}"
+
+    repo_path = Path(REPOS[repo])
+    if not repo_path.is_dir():
+        return f"Repo path does not exist: {repo_path}"
+
+    claude_md = repo_path / "CLAUDE.md"
+    session_id = str(uuid.uuid4())
+
+    if claude_md.exists():
+        # CLAUDE.md already exists — read it and seed a new session with context
+        contents = claude_md.read_text(encoding="utf-8")
+        seed_prompt = (
+            "You are assisting with this codebase. "
+            "Here is the context:\n\n"
+            f"{contents}\n\n"
+            "Answer follow-up questions about this codebase."
+        )
+        response = await run_claude(
+            cwd=repo_path,
+            prompt=seed_prompt,
+            session_id=session_id,
+        )
+        return (
+            f"## Analysis for {repo}\n\n"
+            f"{contents}\n\n"
+            f"---\nsession_id: {response.get('session_id') or session_id}"
+        )
+
+    # No CLAUDE.md — run full analysis
+    init_prompt = PROMPTS["init"]
+    response = await run_claude(
+        cwd=repo_path,
+        prompt=init_prompt,
+        session_id=session_id,
+    )
+
+    if response["is_error"]:
+        return f"Analysis failed: {response['result']}"
+
+    # Read the CLAUDE.md that claude should have created
+    if claude_md.exists():
+        contents = claude_md.read_text(encoding="utf-8")
+    else:
+        # Claude didn't create the file — use its output directly
+        contents = response["result"]
+
+    return (
+        f"## Analysis for {repo}\n\n"
+        f"{contents}\n\n"
+        f"---\nsession_id: {response.get('session_id') or session_id}"
+    )
+
+
+@mcp.tool
+async def query(session_id: str, question: str) -> str:
+    """Ask a follow-up question about a repository within an existing session.
+    Use this AFTER calling analyze_repo to ask specific questions.
+    Claude retains full context from the analysis session.
+
+    Args:
+        session_id: The session ID returned by analyze_repo
+        question: Your question about the codebase
+    """
+    if not session_id or not session_id.strip():
+        return "Error: session_id is required. Call analyze_repo first."
+
+    # We need a cwd for the subprocess. Since the session already has context,
+    # we use the current directory — claude will resume the session regardless.
+    response = await run_claude(
+        cwd=Path.cwd(),
+        prompt=question,
+        resume_id=session_id.strip(),
+    )
+
+    if response["is_error"]:
+        return f"Query failed: {response['result']}"
+
+    return response["result"]
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +244,4 @@ async def health():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import uvicorn
-    print(settings)
-    uvicorn.run(
-        app,
-        host=settings.host,
-        port=settings.port,
-        timeout_keep_alive=600,
-    )
+    mcp.run(transport="streamable-http", host=settings.host, port=settings.port)

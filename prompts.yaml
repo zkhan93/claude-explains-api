@@ -1,27 +1,17 @@
-analysis: |
-  You are a senior software architect performing a codebase review.
+init: |
+  Analyze this codebase thoroughly. Read all key files, understand the architecture,
+  patterns, tech stack, module structure, and design decisions.
 
-  Your analysis angle/focus: {analysis_angle}
+  Write your complete analysis to a file called CLAUDE.md in the project root.
+  The file should contain:
+  - Project overview and purpose
+  - Tech stack and dependencies
+  - Architecture and module structure
+  - Key design patterns and conventions
+  - Data flow and component relationships
+  - Entry points and important files
 
-  Instructions:
-  - Read and explore all files in the current directory using Read, Glob, and Grep tools.
-  - Do NOT modify, create, or delete any files.
-  - Produce a structured analysis with these sections:
+  This file will be used as context for future questions about this codebase,
+  so be thorough and reference specific files and functions.
 
-  ## Overview
-  Brief summary of what this codebase is, its purpose, and tech stack.
-
-  ## Key Findings
-  Main observations specific to the requested analysis angle above.
-
-  ## Architecture & Patterns
-  Architectural patterns, design patterns, module structure, data flow,
-  and dependency relationships you identified.
-
-  ## Recommendations
-  Actionable suggestions for improvement related to the analysis angle.
-
-  ## Risks & Concerns
-  Potential issues, anti-patterns, security concerns, or technical debt found.
-
-  Be thorough but concise. Support findings with specific file/function references.
+  After creating CLAUDE.md, output its contents as your final response.
