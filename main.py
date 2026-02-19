@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import signal
 import uuid
 from pathlib import Path
 
@@ -63,6 +64,18 @@ def _claude_env() -> dict[str, str]:
     return env
 
 
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Kill a subprocess and all its children via process group."""
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def run_claude(
     cwd: Path,
     prompt: str,
@@ -104,6 +117,7 @@ async def run_claude(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=_claude_env(),
+        start_new_session=True,  # own process group so we can kill the whole tree
     )
 
     try:
@@ -111,10 +125,11 @@ async def run_claude(
             process.communicate(),
             timeout=settings.claude_timeout_seconds,
         )
-    except asyncio.TimeoutError:
-        process.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        _kill_process_tree(process)
         await process.communicate()
-        return {"result": "Claude timed out", "session_id": "", "is_error": True}
+        label = "timed out" if isinstance(exc, asyncio.TimeoutError) else "cancelled"
+        return {"result": f"Claude {label}", "session_id": "", "is_error": True}
 
     if process.returncode != 0:
         error_msg = stderr.decode("utf-8", errors="replace").strip()
