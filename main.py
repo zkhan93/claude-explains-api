@@ -7,8 +7,32 @@ from pathlib import Path
 
 import yaml
 from fastmcp import FastMCP
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.cors import CORSMiddleware
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+
+class Repo(BaseModel):
+    name: str
+    path: str
+
+
+class RepoList(BaseModel):
+    repos: list[Repo]
+
+
+class AnalysisResult(BaseModel):
+    content: str
+    session_id: str
+
+
+class QueryResult(BaseModel):
+    answer: str
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -158,12 +182,11 @@ async def run_claude(
 
 
 @mcp.tool
-def list_repos() -> str:
+def list_repos() -> RepoList:
     """List all repositories available for analysis.
     Call this first to see which repositories are configured."""
     repos = load_repos()
-    lines = [f"- {name}: {path}" for name, path in repos.items()]
-    return "Available repositories:\n" + "\n".join(lines)
+    return RepoList(repos=[Repo(name=n, path=p) for n, p in repos.items()])
 
 
 def _resolve_repo(repo: str) -> tuple[Path, str] | str:
@@ -179,10 +202,10 @@ def _resolve_repo(repo: str) -> tuple[Path, str] | str:
 
 
 @mcp.tool
-async def analyze_repo(repo: str) -> str:
+async def analyze_repo(repo: str) -> AnalysisResult:
     """Get a comprehensive analysis of a repository's architecture and design.
     Call this at the START of any task involving a repository.
-    Returns the project's CLAUDE.md context file.
+    Returns the project's CLAUDE.md content and a session_id for follow-up queries.
 
     If the repo has been analyzed before (CLAUDE.md exists), returns it instantly.
     If not, runs a full analysis (may take a few minutes) to create CLAUDE.md.
@@ -192,32 +215,38 @@ async def analyze_repo(repo: str) -> str:
     """
     resolved = _resolve_repo(repo)
     if isinstance(resolved, str):
-        return resolved
-    repo_path, _ = resolved
+        return AnalysisResult(content=resolved, session_id="")
 
+    repo_path, _ = resolved
     claude_md = repo_path / "CLAUDE.md"
+    session_id = str(uuid.uuid4())
 
     if claude_md.exists():
-        return claude_md.read_text(encoding="utf-8")
+        return AnalysisResult(
+            content=claude_md.read_text(encoding="utf-8"),
+            session_id=session_id,
+        )
 
     # No CLAUDE.md — run Claude with init prompt to create it
     response = await run_claude(
         cwd=repo_path,
         prompt=load_prompts()["init"],
-        session_id=str(uuid.uuid4()),
+        session_id=session_id,
     )
 
     if response["is_error"]:
-        return f"Analysis failed: {response['result']}"
+        return AnalysisResult(content=f"Analysis failed: {response['result']}", session_id="")
 
     # Return the CLAUDE.md that Claude created, or fall back to its output
-    if claude_md.exists():
-        return claude_md.read_text(encoding="utf-8")
-    return response["result"]
+    content = claude_md.read_text(encoding="utf-8") if claude_md.exists() else response["result"]
+    return AnalysisResult(
+        content=content,
+        session_id=response.get("session_id") or session_id,
+    )
 
 
 @mcp.tool
-async def query(repo: str, question: str) -> str:
+async def query(repo: str, question: str) -> QueryResult:
     """Ask a question about a repository's codebase.
     Use this AFTER calling analyze_repo to ask specific questions.
     Each call creates a new Claude session with the repo's CLAUDE.md as context.
@@ -228,12 +257,12 @@ async def query(repo: str, question: str) -> str:
     """
     resolved = _resolve_repo(repo)
     if isinstance(resolved, str):
-        return resolved
-    repo_path, _ = resolved
+        return QueryResult(answer=resolved)
 
+    repo_path, _ = resolved
     claude_md = repo_path / "CLAUDE.md"
     if not claude_md.exists():
-        return "No analysis found. Call analyze_repo first."
+        return QueryResult(answer="No analysis found. Call analyze_repo first.")
 
     contents = claude_md.read_text(encoding="utf-8")
     prompt = (
@@ -247,9 +276,9 @@ async def query(repo: str, question: str) -> str:
     )
 
     if response["is_error"]:
-        return f"Query failed: {response['result']}"
+        return QueryResult(answer=f"Query failed: {response['result']}")
 
-    return response["result"]
+    return QueryResult(answer=response["result"])
 
 
 # ---------------------------------------------------------------------------
