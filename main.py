@@ -38,8 +38,12 @@ def load_yaml(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-REPOS: dict[str, str] = load_yaml(settings.repos_file)
-PROMPTS: dict[str, str] = load_yaml(settings.prompts_file)
+def load_repos() -> dict[str, str]:
+    return load_yaml(settings.repos_file)
+
+
+def load_prompts() -> dict[str, str]:
+    return load_yaml(settings.prompts_file)
 
 # ---------------------------------------------------------------------------
 # FastMCP server
@@ -142,97 +146,89 @@ async def run_claude(
 def list_repos() -> str:
     """List all repositories available for analysis.
     Call this first to see which repositories are configured."""
-    lines = [f"- {name}: {path}" for name, path in REPOS.items()]
+    repos = load_repos()
+    lines = [f"- {name}: {path}" for name, path in repos.items()]
     return "Available repositories:\n" + "\n".join(lines)
+
+
+def _resolve_repo(repo: str) -> tuple[Path, str] | str:
+    """Validate repo name and return (repo_path, repo_name) or an error string."""
+    repos = load_repos()
+    if repo not in repos:
+        available = ", ".join(repos.keys())
+        return f"Unknown repo '{repo}'. Available: {available}"
+    repo_path = Path(repos[repo])
+    if not repo_path.is_dir():
+        return f"Repo path does not exist: {repo_path}"
+    return repo_path, repo
 
 
 @mcp.tool
 async def analyze_repo(repo: str) -> str:
     """Get a comprehensive analysis of a repository's architecture and design.
     Call this at the START of any task involving a repository.
-    Returns the project's CLAUDE.md context file and a session_id for follow-up questions.
+    Returns the project's CLAUDE.md context file.
 
-    If the repo has been analyzed before, returns the cached analysis instantly.
-    If not, runs a full analysis (may take a few minutes).
+    If the repo has been analyzed before (CLAUDE.md exists), returns it instantly.
+    If not, runs a full analysis (may take a few minutes) to create CLAUDE.md.
 
     Args:
         repo: Repository name (use list_repos to see available names)
     """
-    if repo not in REPOS:
-        available = ", ".join(REPOS.keys())
-        return f"Unknown repo '{repo}'. Available: {available}"
-
-    repo_path = Path(REPOS[repo])
-    if not repo_path.is_dir():
-        return f"Repo path does not exist: {repo_path}"
+    resolved = _resolve_repo(repo)
+    if isinstance(resolved, str):
+        return resolved
+    repo_path, _ = resolved
 
     claude_md = repo_path / "CLAUDE.md"
-    session_id = str(uuid.uuid4())
 
     if claude_md.exists():
-        # CLAUDE.md already exists — read it and seed a new session with context
-        contents = claude_md.read_text(encoding="utf-8")
-        seed_prompt = (
-            "You are assisting with this codebase. "
-            "Here is the context:\n\n"
-            f"{contents}\n\n"
-            "Answer follow-up questions about this codebase."
-        )
-        response = await run_claude(
-            cwd=repo_path,
-            prompt=seed_prompt,
-            session_id=session_id,
-        )
-        return (
-            f"## Analysis for {repo}\n\n"
-            f"{contents}\n\n"
-            f"---\nsession_id: {response.get('session_id') or session_id}"
-        )
+        return claude_md.read_text(encoding="utf-8")
 
-    # No CLAUDE.md — run full analysis
-    init_prompt = PROMPTS["init"]
+    # No CLAUDE.md — run Claude with init prompt to create it
     response = await run_claude(
         cwd=repo_path,
-        prompt=init_prompt,
-        session_id=session_id,
+        prompt=load_prompts()["init"],
+        session_id=str(uuid.uuid4()),
     )
 
     if response["is_error"]:
         return f"Analysis failed: {response['result']}"
 
-    # Read the CLAUDE.md that claude should have created
+    # Return the CLAUDE.md that Claude created, or fall back to its output
     if claude_md.exists():
-        contents = claude_md.read_text(encoding="utf-8")
-    else:
-        # Claude didn't create the file — use its output directly
-        contents = response["result"]
-
-    return (
-        f"## Analysis for {repo}\n\n"
-        f"{contents}\n\n"
-        f"---\nsession_id: {response.get('session_id') or session_id}"
-    )
+        return claude_md.read_text(encoding="utf-8")
+    return response["result"]
 
 
 @mcp.tool
-async def query(session_id: str, question: str) -> str:
-    """Ask a follow-up question about a repository within an existing session.
+async def query(repo: str, question: str) -> str:
+    """Ask a question about a repository's codebase.
     Use this AFTER calling analyze_repo to ask specific questions.
-    Claude retains full context from the analysis session.
+    Each call creates a new Claude session with the repo's CLAUDE.md as context.
 
     Args:
-        session_id: The session ID returned by analyze_repo
+        repo: Repository name (use list_repos to see available names)
         question: Your question about the codebase
     """
-    if not session_id or not session_id.strip():
-        return "Error: session_id is required. Call analyze_repo first."
+    resolved = _resolve_repo(repo)
+    if isinstance(resolved, str):
+        return resolved
+    repo_path, _ = resolved
 
-    # We need a cwd for the subprocess. Since the session already has context,
-    # we use the current directory — claude will resume the session regardless.
+    claude_md = repo_path / "CLAUDE.md"
+    if not claude_md.exists():
+        return "No analysis found. Call analyze_repo first."
+
+    contents = claude_md.read_text(encoding="utf-8")
+    prompt = (
+        f"Here is the project context:\n\n{contents}\n\n"
+        f"Question: {question}"
+    )
+
     response = await run_claude(
-        cwd=Path.cwd(),
-        prompt=question,
-        resume_id=session_id.strip(),
+        cwd=repo_path,
+        prompt=prompt,
     )
 
     if response["is_error"]:
