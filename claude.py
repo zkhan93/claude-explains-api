@@ -1,11 +1,13 @@
 import asyncio
 import json
+import logging
 import os
 import signal
-
 from pathlib import Path
 
 from models import Settings
+
+logger = logging.getLogger("codebase-analyzer")
 
 
 def _claude_env() -> dict[str, str]:
@@ -31,20 +33,22 @@ async def run_claude(
     settings: Settings,
     cwd: Path,
     prompt: str,
+    output_file: Path,
     session_id: str | None = None,
     resume_id: str | None = None,
 ) -> dict:
-    """Run claude CLI and return parsed JSON response.
+    """Fire claude as a detached process, poll until done, parse output file.
 
-    The prompt is piped via stdin to avoid issues with long/multi-line
-    prompts being passed as shell arguments.
+    stdout is redirected to output_file (JSON format). No pipes are attached
+    to our process — claude runs independently and we just wait for it.
 
     Args:
         settings: App settings.
         cwd: Working directory for claude.
-        prompt: The prompt text.
+        prompt: The prompt text (passed as CLI argument).
+        output_file: Path to write claude's JSON output.
         session_id: Create/continue a named session.
-        resume_id: Resume an existing session (mutually exclusive with session_id).
+        resume_id: Resume an existing session.
 
     Returns:
         dict with keys: result (str), session_id (str), is_error (bool)
@@ -56,8 +60,6 @@ async def run_claude(
         "json",
         "--max-budget-usd",
         str(settings.max_budget_usd),
-        "--permission-mode",
-        "dontAsk",
     ]
 
     if resume_id:
@@ -65,44 +67,101 @@ async def run_claude(
     elif session_id:
         cmd.extend(["--session-id", session_id])
 
-    # Prompt is sent via stdin — no CLI arg length or escaping issues
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_claude_env(),
-        start_new_session=True,
+    cmd.append(prompt)
+
+    logger.info(
+        "Starting claude | cwd=%s session=%s resume=%s prompt_len=%d",
+        cwd,
+        session_id or "-",
+        resume_id or "-",
+        len(prompt),
     )
 
+    # Open output file and fire process — stdout goes to file, not our pipes
+    stdout_fd = open(output_file, "w")
     try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(input=prompt.encode("utf-8")),
-            timeout=settings.claude_timeout_seconds,
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            stdout=stdout_fd,
+            stderr=asyncio.subprocess.PIPE,
+            env=_claude_env(),
+            start_new_session=True,
         )
-    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+    except Exception:
+        stdout_fd.close()
+        raise
+    stdout_fd.close()  # process inherited the fd, we close our copy
+
+    logger.info("Claude subprocess started | pid=%s output=%s", process.pid, output_file)
+
+    # Poll until process exits
+    wait_task = asyncio.create_task(process.wait())
+    elapsed = 0
+    try:
+        while not wait_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=settings.poll_interval_seconds)
+            except asyncio.TimeoutError:
+                elapsed += settings.poll_interval_seconds
+                logger.info("Claude still running | pid=%s elapsed=%ds", process.pid, elapsed)
+                if elapsed >= settings.claude_timeout_seconds:
+                    logger.warning("Claude timed out after %ds | pid=%s", elapsed, process.pid)
+                    _kill_process_tree(process)
+                    await wait_task
+                    return {"result": "Claude timed out", "session_id": "", "is_error": True}
+    except asyncio.CancelledError:
+        logger.warning("Request cancelled — killing claude | pid=%s", process.pid)
         _kill_process_tree(process)
-        await process.communicate()
-        label = "timed out" if isinstance(exc, asyncio.TimeoutError) else "cancelled"
-        return {"result": f"Claude {label}", "session_id": "", "is_error": True}
+        await wait_task
+        raise
+
+    # Collect stderr for error reporting
+    stderr_data = b""
+    if process.stderr:
+        stderr_data = await process.stderr.read()
+
+    logger.info("Claude finished | pid=%s exit=%s elapsed=%ds", process.pid, process.returncode, elapsed)
 
     if process.returncode != 0:
-        error_msg = stderr.decode("utf-8", errors="replace").strip()
+        error_msg = stderr_data.decode("utf-8", errors="replace").strip()
+        logger.error("Claude failed | exit=%s error=%s", process.returncode, error_msg)
         return {
             "result": f"Claude CLI failed (exit {process.returncode}): {error_msg}",
             "session_id": "",
             "is_error": True,
         }
 
-    raw = stdout.decode("utf-8", errors="replace")
+    # Parse the output file
+    try:
+        raw = output_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.error("Output file missing: %s", output_file)
+        return {"result": "Claude produced no output file", "session_id": "", "is_error": True}
+
+    if not raw.strip():
+        logger.error("Output file is empty: %s", output_file)
+        return {"result": "Claude produced empty output", "session_id": "", "is_error": True}
+
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
+        logger.warning("Output is not valid JSON, using raw text")
         return {"result": raw, "session_id": "", "is_error": False}
 
-    return {
+    result = {
         "result": data.get("result", raw),
         "session_id": data.get("session_id", ""),
         "is_error": data.get("is_error", False),
     }
+
+    if result["is_error"]:
+        logger.error("Claude returned error: %s", result["result"][:200])
+    else:
+        logger.info(
+            "Claude success | session=%s result_len=%d",
+            result["session_id"] or "-",
+            len(result["result"]),
+        )
+
+    return result

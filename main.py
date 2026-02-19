@@ -1,3 +1,4 @@
+import logging
 import uuid
 from pathlib import Path
 
@@ -12,7 +13,15 @@ from models import AnalysisResult, QueryResult, Repo, RepoList, Settings
 # Config
 # ---------------------------------------------------------------------------
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("codebase-analyzer")
+
 settings = Settings(_env_file=".env")
+settings.output_dir.mkdir(exist_ok=True)
 
 
 def load_yaml(path: Path) -> dict:
@@ -52,6 +61,11 @@ def _resolve_repo(repo: str) -> tuple[Path, str] | str:
     return repo_path, repo
 
 
+def _output_file(label: str) -> Path:
+    """Create a unique output file path in the output directory."""
+    return settings.output_dir / f"{label}-{uuid.uuid4().hex[:8]}.json"
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
@@ -85,24 +99,27 @@ async def analyze_repo(repo: str) -> AnalysisResult:
     claude_md = repo_path / "CLAUDE.md"
     session_id = str(uuid.uuid4())
 
-    if claude_md.exists():
-        return AnalysisResult(
-            content=claude_md.read_text(encoding="utf-8"),
-            session_id=session_id,
-        )
+    # Always run init prompt — if CLAUDE.md exists, Claude skips re-analysis
+    # and returns quickly. Either way we get a real session for follow-up queries.
+    cached = claude_md.exists()
+    logger.info(
+        "%s for '%s', creating session...",
+        "CLAUDE.md found" if cached else "No CLAUDE.md",
+        repo,
+    )
 
-    # No CLAUDE.md — run Claude with init prompt to create it
     response = await run_claude(
         settings=settings,
         cwd=repo_path,
         prompt=load_prompts()["init"],
+        output_file=_output_file(f"analyze-{repo}"),
         session_id=session_id,
     )
 
     if response["is_error"]:
         return AnalysisResult(content=f"Analysis failed: {response['result']}", session_id="")
 
-    # Return the CLAUDE.md that Claude created, or fall back to its output
+    # Always return CLAUDE.md contents (ignore Claude's response text when cached)
     content = claude_md.read_text(encoding="utf-8") if claude_md.exists() else response["result"]
     return AnalysisResult(
         content=content,
@@ -111,34 +128,24 @@ async def analyze_repo(repo: str) -> AnalysisResult:
 
 
 @mcp.tool
-async def query(repo: str, question: str) -> QueryResult:
-    """Ask a question about a repository's codebase.
-    Use this AFTER calling analyze_repo to ask specific questions.
-    Each call creates a new Claude session with the repo's CLAUDE.md as context.
+async def query(session_id: str, question: str) -> QueryResult:
+    """Ask a follow-up question about a repository within an existing session.
+    Use this AFTER calling analyze_repo — pass the session_id it returned.
+    Claude resumes the session with full context from the analysis.
 
     Args:
-        repo: Repository name (use list_repos to see available names)
+        session_id: The session_id returned by analyze_repo
         question: Your question about the codebase
     """
-    resolved = _resolve_repo(repo)
-    if isinstance(resolved, str):
-        return QueryResult(answer=resolved)
-
-    repo_path, _ = resolved
-    claude_md = repo_path / "CLAUDE.md"
-    if not claude_md.exists():
-        return QueryResult(answer="No analysis found. Call analyze_repo first.")
-
-    contents = claude_md.read_text(encoding="utf-8")
-    prompt = (
-        f"Here is the project context:\n\n{contents}\n\n"
-        f"Question: {question}"
-    )
+    if not session_id or not session_id.strip():
+        return QueryResult(answer="session_id is required. Call analyze_repo first.")
 
     response = await run_claude(
         settings=settings,
-        cwd=repo_path,
-        prompt=prompt,
+        cwd=Path.cwd(),
+        prompt=question,
+        output_file=_output_file("query"),
+        resume_id=session_id.strip(),
     )
 
     if response["is_error"]:

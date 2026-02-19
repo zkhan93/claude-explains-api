@@ -15,10 +15,12 @@ class Settings(BaseSettings):
     repos_file: Path = Path("repos.yaml")
     prompts_file: Path = Path("prompts.yaml")
     claude_timeout_seconds: int = 600
+    poll_interval_seconds: int = 5
     max_budget_usd: float = 5.00
     host: str = "0.0.0.0"
     port: int = 8000
     cors_origins: list[str] = ["*"]
+    output_dir: Path = Path("output")
 
 
 # ---------------------------------------------------------------------------

@@ -14,4 +14,6 @@ init: |
   This file will be used as context for future questions about this codebase,
   so be thorough and reference specific files and functions.
 
-  After creating CLAUDE.md, output its contents as your final response.
+  IMPORTANT: Your final message must be complete and self-contained.
+  After creating CLAUDE.md, output its full contents as your final response.
+  Do not reference previous messages — include everything in your last response.
