@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     port: int = 8000
 
 
-settings = Settings()
+settings = Settings(_env_file=".env")
 settings.cache_dir.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
