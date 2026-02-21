@@ -110,7 +110,7 @@ async def run_claude(
 
     logger.info("Claude subprocess started | pid=%s output=%s", process.pid, output_file)
 
-    # Poll until process exits
+    # Poll until process exits — no server-side timeout, let the client decide
     wait_task = asyncio.create_task(process.wait())
     elapsed = 0
     try:
@@ -120,11 +120,6 @@ async def run_claude(
             except asyncio.TimeoutError:
                 elapsed += settings.poll_interval_seconds
                 logger.info("Claude still running | pid=%s elapsed=%ds", process.pid, elapsed)
-                if elapsed >= settings.claude_timeout_seconds:
-                    logger.warning("Claude timed out after %ds | pid=%s", elapsed, process.pid)
-                    _kill_process_tree(process)
-                    await wait_task
-                    return {"result": "Claude timed out", "session_id": "", "is_error": True}
     except asyncio.CancelledError:
         logger.warning("Request cancelled — killing claude | pid=%s", process.pid)
         _kill_process_tree(process)
