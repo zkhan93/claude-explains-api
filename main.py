@@ -136,23 +136,30 @@ async def analyze_repo(repo: str) -> AnalysisResult:
 
 
 @mcp.tool
-async def query(session_id: str, question: str) -> QueryResult:
+async def query(repo: str, session_id: str, question: str) -> QueryResult:
     """Ask a follow-up question about a repository within an existing session.
-    Use this AFTER calling analyze_repo — pass the session_id it returned.
+    Use this AFTER calling analyze_repo — pass the repo name and session_id it returned.
     Claude resumes the session with full context from the analysis.
 
     Args:
+        repo: Repository name (same one passed to analyze_repo)
         session_id: The session_id returned by analyze_repo
         question: Your question about the codebase
     """
     if not session_id or not session_id.strip():
         return QueryResult(answer="session_id is required. Call analyze_repo first.")
 
+    resolved = _resolve_repo(repo)
+    if isinstance(resolved, str):
+        return QueryResult(answer=resolved)
+
+    repo_path, _ = resolved
+
     response = await run_claude(
         settings=settings,
-        cwd=Path.cwd(),
+        cwd=repo_path,
         prompt=question,
-        output_file=_output_file("query"),
+        output_file=_output_file(f"query-{repo}"),
         resume_id=session_id.strip(),
     )
 
