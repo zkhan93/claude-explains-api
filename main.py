@@ -65,7 +65,7 @@ def _resolve_repo(repo: str) -> tuple[Path, str] | str:
 
 def _output_file(label: str) -> Path:
     """Create a unique output file path in the output directory."""
-    return settings.output_dir / f"{label}-{uuid.uuid4().hex[:8]}.json"
+    return settings.output_dir / f"{label}-{uuid.uuid4().hex[:8]}.jsonl"
 
 
 # ---------------------------------------------------------------------------

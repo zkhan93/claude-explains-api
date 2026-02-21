@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -7,6 +6,7 @@ import sys
 from pathlib import Path
 
 from models import Settings
+from parser import parse_stream_jsonl
 
 # Own handler so uvicorn can't silence us
 logger = logging.getLogger("codebase-analyzer")
@@ -46,14 +46,15 @@ async def run_claude(
 ) -> dict:
     """Fire claude as a detached process, poll until done, parse output file.
 
-    stdout is redirected to output_file (JSON format) via raw fd.
-    No pipes are attached to our process — claude runs independently.
+    Uses --output-format stream-json --verbose so the output file fills up
+    as claude works (tail -f to watch progress). When done, parses the JSONL
+    to extract the final result.
 
     Args:
         settings: App settings.
         cwd: Working directory for claude.
         prompt: The prompt text (passed as CLI argument).
-        output_file: Path to write claude's JSON output.
+        output_file: Path to write claude's stream-json output.
         session_id: Create/continue a named session.
         resume_id: Resume an existing session.
 
@@ -64,7 +65,8 @@ async def run_claude(
         "claude",
         "-p",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--max-budget-usd",
         str(settings.max_budget_usd),
     ]
@@ -83,7 +85,8 @@ async def run_claude(
         resume_id or "-",
         len(prompt),
     )
-    logger.info("Command: %s", " ".join(cmd[:6]) + " ...")
+    logger.info("Command: %s", " ".join(cmd[:8]) + " ...")
+    logger.info("Output: %s (tail -f to watch progress)", output_file)
 
     # Redirect stdout to file via raw fd — no pipes to our process
     stderr_file = output_file.with_suffix(".stderr")
@@ -97,7 +100,7 @@ async def run_claude(
             stdout=stdout_fd.fileno(),
             stderr=stderr_fd.fileno(),
             env=_claude_env(),
-            process_group=0,  # own process group (for killpg), same session (Ctrl+C works)
+            process_group=0,
         )
     except Exception as exc:
         logger.error("Failed to start claude: %s", exc)
@@ -108,7 +111,7 @@ async def run_claude(
         stdout_fd.close()
         stderr_fd.close()
 
-    logger.info("Claude subprocess started | pid=%s output=%s", process.pid, output_file)
+    logger.info("Claude subprocess started | pid=%s", process.pid)
 
     # Poll until process exits — no server-side timeout, let the client decide
     wait_task = asyncio.create_task(process.wait())
@@ -139,28 +142,8 @@ async def run_claude(
             "is_error": True,
         }
 
-    # Parse the output file
-    try:
-        raw = output_file.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        logger.error("Output file missing: %s", output_file)
-        return {"result": "Claude produced no output file", "session_id": "", "is_error": True}
-
-    if not raw.strip():
-        logger.error("Output file is empty: %s", output_file)
-        return {"result": "Claude produced empty output", "session_id": "", "is_error": True}
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Output is not valid JSON, using raw text (len=%d)", len(raw))
-        return {"result": raw, "session_id": "", "is_error": False}
-
-    result = {
-        "result": data.get("result", raw),
-        "session_id": data.get("session_id", ""),
-        "is_error": data.get("is_error", False),
-    }
+    # Parse the stream-json output
+    result = parse_stream_jsonl(output_file)
 
     if result["is_error"]:
         logger.error("Claude returned error: %s", result["result"][:200])
