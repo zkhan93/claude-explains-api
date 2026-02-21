@@ -3,11 +3,18 @@ import json
 import logging
 import os
 import signal
+import sys
 from pathlib import Path
 
 from models import Settings
 
+# Own handler so uvicorn can't silence us
 logger = logging.getLogger("codebase-analyzer")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 def _claude_env() -> dict[str, str]:
@@ -39,8 +46,8 @@ async def run_claude(
 ) -> dict:
     """Fire claude as a detached process, poll until done, parse output file.
 
-    stdout is redirected to output_file (JSON format). No pipes are attached
-    to our process — claude runs independently and we just wait for it.
+    stdout is redirected to output_file (JSON format) via raw fd.
+    No pipes are attached to our process — claude runs independently.
 
     Args:
         settings: App settings.
@@ -76,22 +83,30 @@ async def run_claude(
         resume_id or "-",
         len(prompt),
     )
+    logger.info("Command: %s", " ".join(cmd[:6]) + " ...")
 
-    # Open output file and fire process — stdout goes to file, not our pipes
+    # Redirect stdout to file via raw fd — no pipes to our process
+    stderr_file = output_file.with_suffix(".stderr")
     stdout_fd = open(output_file, "w")
+    stderr_fd = open(stderr_file, "w")
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd),
-            stdout=stdout_fd,
-            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=stdout_fd.fileno(),
+            stderr=stderr_fd.fileno(),
             env=_claude_env(),
-            start_new_session=True,
+            process_group=0,  # own process group (for killpg), same session (Ctrl+C works)
         )
-    except Exception:
+    except Exception as exc:
+        logger.error("Failed to start claude: %s", exc)
         stdout_fd.close()
-        raise
-    stdout_fd.close()  # process inherited the fd, we close our copy
+        stderr_fd.close()
+        return {"result": f"Failed to start claude: {exc}", "session_id": "", "is_error": True}
+    finally:
+        stdout_fd.close()
+        stderr_fd.close()
 
     logger.info("Claude subprocess started | pid=%s output=%s", process.pid, output_file)
 
@@ -116,16 +131,13 @@ async def run_claude(
         await wait_task
         raise
 
-    # Collect stderr for error reporting
-    stderr_data = b""
-    if process.stderr:
-        stderr_data = await process.stderr.read()
-
     logger.info("Claude finished | pid=%s exit=%s elapsed=%ds", process.pid, process.returncode, elapsed)
 
     if process.returncode != 0:
-        error_msg = stderr_data.decode("utf-8", errors="replace").strip()
-        logger.error("Claude failed | exit=%s error=%s", process.returncode, error_msg)
+        error_msg = ""
+        if stderr_file.exists():
+            error_msg = stderr_file.read_text(encoding="utf-8", errors="replace").strip()
+        logger.error("Claude failed | exit=%s error=%s", process.returncode, error_msg[:500])
         return {
             "result": f"Claude CLI failed (exit {process.returncode}): {error_msg}",
             "session_id": "",
@@ -146,7 +158,7 @@ async def run_claude(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("Output is not valid JSON, using raw text")
+        logger.warning("Output is not valid JSON, using raw text (len=%d)", len(raw))
         return {"result": raw, "session_id": "", "is_error": False}
 
     result = {

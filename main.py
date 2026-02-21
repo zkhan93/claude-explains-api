@@ -1,4 +1,5 @@
 import logging
+import sys
 import uuid
 from pathlib import Path
 
@@ -13,12 +14,13 @@ from models import AnalysisResult, QueryResult, Repo, RepoList, Settings
 # Config
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Own handler on stderr so uvicorn can't silence us
 logger = logging.getLogger("codebase-analyzer")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 settings = Settings(_env_file=".env")
 settings.output_dir.mkdir(exist_ok=True)
