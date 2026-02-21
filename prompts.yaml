@@ -1,9 +1,12 @@
 init: |
-  Analyze this codebase thoroughly. Read all key files, understand the architecture,
-  patterns, tech stack, module structure, and design decisions.
+  Check if CLAUDE.md exists in the project root.
 
-  Write your complete analysis to a file called CLAUDE.md in the project root.
-  The file should contain:
+  If CLAUDE.md already exists and looks complete, read it and output its contents
+  as your response. Do NOT recreate or overwrite it.
+
+  If CLAUDE.md does not exist or is incomplete, analyze this codebase thoroughly.
+  Read all key files, understand the architecture, patterns, tech stack, module
+  structure, and design decisions. Then write your analysis to CLAUDE.md with:
   - Project overview and purpose
   - Tech stack and dependencies
   - Architecture and module structure
@@ -11,9 +14,7 @@ init: |
   - Data flow and component relationships
   - Entry points and important files
 
-  This file will be used as context for future questions about this codebase,
-  so be thorough and reference specific files and functions.
+  Be thorough and reference specific files and functions.
 
   IMPORTANT: Your final message must be complete and self-contained.
-  After creating CLAUDE.md, output its full contents as your final response.
-  Do not reference previous messages — include everything in your last response.
+  Output the full contents of CLAUDE.md as your final response.

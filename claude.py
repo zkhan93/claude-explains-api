@@ -67,6 +67,7 @@ async def run_claude(
         "--output-format",
         "stream-json",
         "--verbose",
+        "--dangerously-skip-permissions",
         "--max-budget-usd",
         str(settings.max_budget_usd),
     ]
