@@ -39,7 +39,11 @@ class RepoList(BaseModel):
 class AnalysisResult(BaseModel):
     content: str
     session_id: str
+    errors: list[str] = []
+    cost_usd: float = 0.0
 
 
 class QueryResult(BaseModel):
     answer: str
+    errors: list[str] = []
+    cost_usd: float = 0.0

@@ -32,6 +32,8 @@ def parse_stream_jsonl(output_file: Path) -> dict:
     last_assistant_text = ""
     session_id = ""
     is_error = False
+    errors: list[str] = []
+    cost_usd = 0.0
 
     for line in lines:
         line = line.strip()
@@ -44,10 +46,12 @@ def parse_stream_jsonl(output_file: Path) -> dict:
 
         event_type = event.get("type", "")
 
-        # "result" event has session_id and final metadata
+        # "result" event has session_id, errors, cost, and final metadata
         if event_type == "result":
             session_id = event.get("session_id", session_id)
             is_error = event.get("is_error", is_error)
+            errors = event.get("errors", errors)
+            cost_usd = event.get("total_cost_usd", cost_usd)
             # result event may also carry the final text
             if event.get("result"):
                 last_assistant_text = event["result"]
@@ -74,22 +78,30 @@ def parse_stream_jsonl(output_file: Path) -> dict:
                 "result": data.get("result", raw),
                 "session_id": data.get("session_id", ""),
                 "is_error": data.get("is_error", False),
+                "errors": data.get("errors", []),
+                "cost_usd": data.get("total_cost_usd", 0.0),
             }
         except json.JSONDecodeError:
             pass
 
         logger.warning("No assistant message or result found in JSONL (lines=%d)", len(lines))
-        return {"result": raw, "session_id": "", "is_error": False}
+        return {"result": raw, "session_id": "", "is_error": False, "errors": [], "cost_usd": 0.0}
+
+    if is_error and errors:
+        logger.error("Claude errors: %s", errors)
 
     logger.info(
-        "Parsed JSONL | lines=%d result_len=%d session=%s",
+        "Parsed JSONL | lines=%d result_len=%d session=%s cost=$%.4f",
         len(lines),
         len(last_assistant_text),
         session_id or "-",
+        cost_usd,
     )
 
     return {
         "result": last_assistant_text,
         "session_id": session_id,
         "is_error": is_error,
+        "errors": errors,
+        "cost_usd": cost_usd,
     }

@@ -119,13 +119,19 @@ async def analyze_repo(repo: str) -> AnalysisResult:
     )
 
     if response["is_error"]:
-        return AnalysisResult(content=f"Analysis failed: {response['result']}", session_id="")
+        return AnalysisResult(
+            content=f"Analysis failed: {response['result']}",
+            session_id=response.get("session_id", ""),
+            errors=response.get("errors", []),
+            cost_usd=response.get("cost_usd", 0.0),
+        )
 
     # Always return CLAUDE.md contents (ignore Claude's response text when cached)
     content = claude_md.read_text(encoding="utf-8") if claude_md.exists() else response["result"]
     return AnalysisResult(
         content=content,
-        session_id=response.get("session_id") or session_id,
+        session_id=response.get("session_id", ""),
+        cost_usd=response.get("cost_usd", 0.0),
     )
 
 
@@ -151,9 +157,16 @@ async def query(session_id: str, question: str) -> QueryResult:
     )
 
     if response["is_error"]:
-        return QueryResult(answer=f"Query failed: {response['result']}")
+        return QueryResult(
+            answer=f"Query failed: {response['result']}",
+            errors=response.get("errors", []),
+            cost_usd=response.get("cost_usd", 0.0),
+        )
 
-    return QueryResult(answer=response["result"])
+    return QueryResult(
+        answer=response["result"],
+        cost_usd=response.get("cost_usd", 0.0),
+    )
 
 
 # ---------------------------------------------------------------------------
